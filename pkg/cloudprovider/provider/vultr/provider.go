@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/kubermatic/machine-controller/pkg/apis/cluster/common"
 	clusterv1alpha1 "github.com/kubermatic/machine-controller/pkg/apis/cluster/v1alpha1"
@@ -298,6 +299,8 @@ func (p *provider) Cleanup(ctx context.Context, machine *clusterv1alpha1.Machine
 				Message: err.Error(),
 			}
 		}
+
+		time.Sleep(120 * time.Second)
 
 		return false, nil
 	} else if c.MachineType == string(vultrtypes.CloudInstance) {
