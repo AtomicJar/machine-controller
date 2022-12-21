@@ -89,10 +89,6 @@ func (eng *Docker) ScriptFor(os types.OperatingSystem) (string, error) {
 		ContainerdVersion: DefaultDockerContainerdVersion,
 	}
 
-	if eng.containerdVersion != "" {
-		args.ContainerdVersion = eng.containerdVersion
-	}
-
 	switch os {
 	case types.OperatingSystemAmazonLinux2:
 		args.ContainerdVersion = LegacyDockerContainerdVersion
@@ -109,6 +105,10 @@ func (eng *Docker) ScriptFor(os types.OperatingSystem) (string, error) {
 		return buf.String(), err
 	case types.OperatingSystemSLES:
 		return "", nil
+	}
+
+	if eng.containerdVersion != "" {
+		args.ContainerdVersion = eng.containerdVersion
 	}
 
 	return "", fmt.Errorf("unknown OS: %s", os)

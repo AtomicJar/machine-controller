@@ -67,10 +67,6 @@ func (eng *Containerd) ScriptFor(os types.OperatingSystem) (string, error) {
 		ContainerdVersion: DefaultContainerdVersion,
 	}
 
-	if eng.version != "" {
-		args.ContainerdVersion = eng.version
-	}
-
 	switch os {
 	case types.OperatingSystemAmazonLinux2:
 		// Amazon Linux 2 does not have containerd 1.5
@@ -88,6 +84,10 @@ func (eng *Containerd) ScriptFor(os types.OperatingSystem) (string, error) {
 		return buf.String(), err
 	case types.OperatingSystemSLES:
 		return "", nil
+	}
+
+	if eng.version != "" {
+		args.ContainerdVersion = eng.version
 	}
 
 	return "", fmt.Errorf("unknown OS: %s", os)
