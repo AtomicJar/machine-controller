@@ -34,3 +34,10 @@ func GetConfig(pconfig providerconfigtypes.Config) (*RawConfig, error) {
 
 	return rawConfig, jsonutil.StrictUnmarshal(pconfig.CloudProviderSpec.Raw, rawConfig)
 }
+
+type MachineType string
+
+const (
+	BareMetal     MachineType = "bare-metal"
+	CloudInstance MachineType = "cloud-instance"
+)

@@ -20,9 +20,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/vultr/govultr/v2"
 	"strconv"
 
-	"github.com/vultr/govultr/v2"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 
@@ -50,11 +50,12 @@ func New(configVarResolver *providerconfig.ConfigVarResolver) cloudprovidertypes
 }
 
 type Config struct {
-	APIKey string
-	Region string
-	Plan   string
-	OsID   string
-	Tags   []string
+	APIKey      string
+	Region      string
+	Plan        string
+	OsID        string
+	MachineType string
+	Tags        []string
 }
 
 func getIDForOS(os providerconfigtypes.OperatingSystem) (int, error) {
@@ -155,28 +156,48 @@ func (p *provider) Validate(ctx context.Context, _ *zap.SugaredLogger, spec clus
 
 	client := getClient(ctx, c.APIKey)
 
-	plans, err := client.Region.Availability(ctx, c.Region, "")
-
-	// TODO: Validate region separately
-	if err != nil {
-		return fmt.Errorf("invalid/not supported region specified %q: %w", c.Region, err)
-	}
-
-	planFound := false
-
-	// Check if given plan present in the returned list
-	for _, plan := range plans.AvailablePlans {
-		if plan == c.Plan {
-			planFound = true
+	if c.MachineType == string(vultrtypes.CloudInstance) || c.MachineType == "" {
+		plans, err := client.Region.Availability(ctx, c.Region, "all")
+		if err != nil {
+			return fmt.Errorf("invalid/not supported region specified %q: %w", c.Region, err)
 		}
+		var planFound bool
+		for _, p := range plans.AvailablePlans {
+			if p == c.Plan {
+				planFound = true
+				break
+			}
+		}
+		if !planFound {
+			return fmt.Errorf("invalid/not supported plan specified %q: %w", c.Plan, err)
+		}
+	} else if c.MachineType == string(vultrtypes.BareMetal) {
+		planAvailability, _, err := client.Plan.ListBareMetal(ctx, nil)
+		if err != nil {
+			return err
+		}
+
+		var foundPlanRegion bool
+		for _, p := range planAvailability {
+			if p.ID == c.Plan {
+				for _, r := range p.Locations {
+					if r == c.Region {
+						foundPlanRegion = true
+					}
+				}
+			}
+		}
+		if !foundPlanRegion {
+			return fmt.Errorf("plan %q not available on region %q", c.Plan, c.Region)
+		}
+	} else {
+		return fmt.Errorf("unknown machine type %q", c.MachineType)
 	}
-	if !planFound {
-		return fmt.Errorf("invalid/not supported plan specified %q: %w", c.Plan, err)
-	}
+
 	return nil
 }
 
-func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (*vultrInstance, error) {
+func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (*vultrCloudInstance, error) {
 	c, _, err := p.getConfig(machine.Spec.ProviderSpec)
 	if err != nil {
 		return nil, cloudprovidererrors.TerminalError{
@@ -197,7 +218,7 @@ func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (*
 	for _, instance := range instances {
 		for _, tag := range instance.Tags {
 			if tag == string(machine.UID) {
-				return &vultrInstance{instance: &instance}, nil
+				return &vultrCloudInstance{instance: &instance}, nil
 			}
 		}
 	}
@@ -246,21 +267,38 @@ func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *cl
 		return nil, err
 	}
 
-	instanceCreateRequest := govultr.InstanceCreateReq{
-		Region:   c.Region,
-		Plan:     c.Plan,
-		Label:    machine.Spec.Name,
-		UserData: userdata,
-		Tags:     c.Tags,
-		OsID:     strOsID,
-	}
+	if c.MachineType == string(vultrtypes.CloudInstance) || c.MachineType == "" {
+		instanceCreateRequest := govultr.InstanceCreateReq{
+			Region:   c.Region,
+			Plan:     c.Plan,
+			Label:    machine.Spec.Name,
+			UserData: userdata,
+			Tags:     c.Tags,
+			OsID:     strOsID,
+		}
 
-	res, err := client.Instance.Create(ctx, &instanceCreateRequest)
-	if err != nil {
-		return nil, vltErrorToTerminalError(err, "failed to create server")
-	}
+		res, err := client.Instance.Create(ctx, &instanceCreateRequest)
+		if err != nil {
+			return nil, vltErrorToTerminalError(err, "failed to create cloud-instance")
+		}
+		return &vultrCloudInstance{instance: res}, nil
+	} else if c.MachineType == string(vultrtypes.BareMetal) {
+		instanceOpts := govultr.BareMetalCreate{
+			Region:   c.Region,
+			Plan:     c.Plan,
+			Label:    machine.Spec.Name,
+			UserData: userdata,
+			Tags:     c.Tags,
+			OsID:     strOsID,
+		}
 
-	return &vultrInstance{instance: res}, nil
+		res, err := client.BareMetalServer.Create(ctx, &instanceOpts)
+		if err != nil {
+			return nil, fmt.Errorf("could not create bare-metal instance: %w", err)
+		}
+		return &vultrBareMetalInstance{instance: res}, nil
+	}
+	return nil, fmt.Errorf("could not create instance: %w", err)
 }
 
 func (p *provider) Cleanup(ctx context.Context, log *zap.SugaredLogger, machine *clusterv1alpha1.Machine, data *cloudprovidertypes.ProviderData) (bool, error) {
@@ -325,30 +363,64 @@ func (p *provider) MigrateUID(ctx context.Context, _ *zap.SugaredLogger, machine
 	return nil
 }
 
-type vultrInstance struct {
+type vultrCloudInstance struct {
 	instance *govultr.Instance
 }
 
-func (v *vultrInstance) Name() string {
+type vultrBareMetalInstance struct {
+	instance *govultr.BareMetalServer
+}
+
+func (v *vultrCloudInstance) Name() string {
 	return v.instance.Label
 }
 
-func (v *vultrInstance) ID() string {
+func (v *vultrBareMetalInstance) Name() string {
+	return v.instance.Label
+}
+
+func (v *vultrCloudInstance) ID() string {
 	return v.instance.ID
 }
 
-func (v *vultrInstance) ProviderID() string {
-	return "vultr://" + v.instance.ID
+func (v *vultrBareMetalInstance) ID() string {
+	return v.instance.ID
 }
 
-func (v *vultrInstance) Addresses() map[string]v1.NodeAddressType {
+func (v *vultrCloudInstance) ProviderID() string {
+	return fmt.Sprintf("vultr://%s", v.instance.ID)
+}
+
+func (v *vultrBareMetalInstance) ProviderID() string {
+	return fmt.Sprintf("vultr://%s", v.instance.ID)
+}
+
+func (v *vultrCloudInstance) Addresses() map[string]v1.NodeAddressType {
 	addresses := map[string]v1.NodeAddressType{}
 	addresses[v.instance.MainIP] = v1.NodeExternalIP
 	addresses[v.instance.InternalIP] = v1.NodeInternalIP
 	return addresses
 }
 
-func (v *vultrInstance) Status() instance.Status {
+func (v *vultrBareMetalInstance) Addresses() map[string]v1.NodeAddressType {
+	addresses := map[string]v1.NodeAddressType{}
+	addresses[v.instance.MainIP] = v1.NodeExternalIP
+	return addresses
+}
+
+func (v *vultrCloudInstance) Status() instance.Status {
+	switch v.instance.Status {
+	case "active":
+		return instance.StatusRunning
+	case "pending":
+		return instance.StatusCreating
+		// "suspending" or "resizing"
+	default:
+		return instance.StatusUnknown
+	}
+}
+
+func (v *vultrBareMetalInstance) Status() instance.Status {
 	switch v.instance.Status {
 	case "active":
 		return instance.StatusRunning
