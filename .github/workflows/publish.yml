@@ -1,0 +1,45 @@
+name: Publish
+run-name: Publishing "${{ github.event.workflow_run.head_commit.message }}"
+
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [aj-main]
+    types: [completed]
+
+jobs:
+  on-success:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - run: echo 'The triggering workflow passed'
+  on-failure:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    steps:
+      - run: echo 'The triggering workflow failed'
+  publish:
+    runs-on: ubuntu-latest
+    needs: [ on-success ]
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      - name: Print version tag
+        run: git describe --tags --dirty=-dirty --always
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          cache-dependency-path: go.sum
+          go-version-file: go.mod
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+      - name: Publish image
+        run: make docker-image-publish
+        env:
+          IMAGE_NAME: "atomicjar/machine-controller:${{ github.event.workflow_run.head_commit.id }}"
+          IMAGE_TAG: ${{ github.event.workflow_run.head_commit.id }}
+
