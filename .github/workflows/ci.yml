@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [ aj-main ]
+  pull_request:
+    branches: [ aj-main ]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          # depth 0 makes the whole history checked out, and without it the build and tests differ, because default
+          # depth of 1 might easily fetch a non-tagged commit, hence the version isn't semantic but commit has only
+          fetch-depth: 0
+      - name: Print version tag
+        run: git describe --tags --dirty=-dirty --always
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          cache-dependency-path: go.sum
+          go-version-file: go.mod
+      - name: Run unit tests
+        run: make test-unit
