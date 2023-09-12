@@ -19,11 +19,13 @@ package vultr
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/vultr/govultr/v2"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"k8s.io/apimachinery/pkg/runtime"
 	"strconv"
 
 	"github.com/kubermatic/machine-controller/pkg/apis/cluster/common"
@@ -197,7 +199,7 @@ func (p *provider) Validate(ctx context.Context, _ *zap.SugaredLogger, spec clus
 	return nil
 }
 
-func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (instance.Instance, error) {
+func (p *provider) Get(ctx context.Context, log *zap.SugaredLogger, machine *clusterv1alpha1.Machine, _ *cloudprovidertypes.ProviderData) (instance.Instance, error) {
 	c, _, err := p.getConfig(machine.Spec.ProviderSpec)
 	if err != nil {
 		return nil, cloudprovidererrors.TerminalError{
@@ -206,52 +208,77 @@ func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (i
 		}
 	}
 
-	client := getClient(ctx, c.APIKey)
+	status := getProviderStatus(log, machine)
 
+	if status.VultrId != "" {
+		return GetById(ctx, c, status.VultrId)
+	} else {
+		return GetByTag(ctx, c, string(machine.UID))
+	}
+}
+
+func GetById(ctx context.Context, c *Config, id string) (instance.Instance, error) {
+	client := getClient(ctx, c.APIKey)
+	if c.MachineType == string(vultrtypes.CloudInstance) || c.MachineType == "" {
+		res, err := client.Instance.Get(ctx, id)
+		// TODO - handle instance not found by ID as non-terminal code
+		if err != nil {
+			return nil, vltErrorToTerminalError(err, "failed to get instance by id")
+		}
+		return &vultrCloudInstance{instance: res}, nil
+	} else if c.MachineType == string(vultrtypes.BareMetal) {
+		res, err := client.BareMetalServer.Get(ctx, id)
+		// TODO - handle instance not found by ID as non-terminal code
+		if err != nil {
+			return nil, vltErrorToTerminalError(err, "failed to get instance by id")
+		}
+		return &vultrBareMetalInstance{instance: res}, nil
+	}
+	return nil, cloudprovidererrors.ErrInstanceNotFound
+}
+
+func GetByTag(ctx context.Context, c *Config, machineId string) (instance.Instance, error) {
+	client := getClient(ctx, c.APIKey)
 	if c.MachineType == string(vultrtypes.CloudInstance) || c.MachineType == "" {
 		instances, _, err := client.Instance.List(ctx, &govultr.ListOptions{
-			Tag: string(machine.UID),
+			Tag: machineId,
 		})
 		if err != nil {
 			return nil, vltErrorToTerminalError(err, "failed to list servers")
 		}
 		for _, inst := range instances {
 			for _, tag := range inst.Tags {
-				if tag == string(machine.UID) {
+				if tag == machineId {
 					return &vultrCloudInstance{instance: &inst}, nil
 				}
 			}
 		}
 	} else if c.MachineType == string(vultrtypes.BareMetal) {
-		instances, _, err := client.BareMetalServer.List(ctx, &govultr.ListOptions{Tag: fmt.Sprintf("machineUid=%s", machine.UID)})
+		instances, _, err := client.BareMetalServer.List(ctx, &govultr.ListOptions{
+			Tag: fmt.Sprintf("machineUid=%s", machineId),
+		})
 		if err != nil {
 			return nil, cloudprovidererrors.TerminalError{
 				Reason:  common.InvalidConfigurationMachineError,
 				Message: err.Error(),
 			}
 		}
-
 		for _, inst := range instances {
 			for _, tag := range inst.Tags {
-				if tag == fmt.Sprintf("machineUid=%s", machine.UID) {
+				if tag == fmt.Sprintf("machineUid=%s", machineId) {
 					return &vultrBareMetalInstance{instance: &inst}, nil
 				}
 			}
 		}
 	}
-
 	return nil, cloudprovidererrors.ErrInstanceNotFound
-}
-
-func (p *provider) Get(ctx context.Context, _ *zap.SugaredLogger, machine *clusterv1alpha1.Machine, _ *cloudprovidertypes.ProviderData) (instance.Instance, error) {
-	return p.get(ctx, machine)
 }
 
 func (p *provider) GetCloudConfig(_ clusterv1alpha1.MachineSpec) (config string, name string, err error) {
 	return "", "", nil
 }
 
-func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *clusterv1alpha1.Machine, _ *cloudprovidertypes.ProviderData, userdata string) (instance.Instance, error) {
+func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *clusterv1alpha1.Machine, pd *cloudprovidertypes.ProviderData, userdata string) (instance.Instance, error) {
 	c, pc, err := p.getConfig(machine.Spec.ProviderSpec)
 	if err != nil {
 		return nil, cloudprovidererrors.TerminalError{
@@ -298,6 +325,13 @@ func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *cl
 		if err != nil {
 			return nil, vltErrorToTerminalError(err, "failed to create cloud-instance")
 		}
+		status := vultrtypes.ProviderStatus{
+			VultrId: res.ID,
+		}
+		err = setProviderStatus(machine, status, pd.Update)
+		if err != nil {
+			return nil, vltErrorToTerminalError(err, "failed to update machine status")
+		}
 		return &vultrCloudInstance{instance: res}, nil
 	} else if c.MachineType == string(vultrtypes.BareMetal) {
 		instanceOpts := govultr.BareMetalCreate{
@@ -312,6 +346,13 @@ func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *cl
 		res, err := client.BareMetalServer.Create(ctx, &instanceOpts)
 		if err != nil {
 			return nil, fmt.Errorf("could not create bare-metal instance: %w", err)
+		}
+		status := vultrtypes.ProviderStatus{
+			VultrId: res.ID,
+		}
+		err = setProviderStatus(machine, status, pd.Update)
+		if err != nil {
+			return nil, vltErrorToTerminalError(err, "failed to update machine status")
 		}
 		return &vultrBareMetalInstance{instance: res}, nil
 	}
@@ -510,4 +551,28 @@ func vltErrorToTerminalError(err error, msg string) error {
 
 func (p *provider) SetMetricsForMachines(_ clusterv1alpha1.MachineList) error {
 	return nil
+}
+
+func setProviderStatus(machine *clusterv1alpha1.Machine, status vultrtypes.ProviderStatus, updater cloudprovidertypes.MachineUpdater) error {
+	rawStatus, err := json.Marshal(status)
+	if err != nil {
+		return err
+	}
+	return updater(machine, func(machine *clusterv1alpha1.Machine) {
+		machine.Status.ProviderStatus = &runtime.RawExtension{
+			Raw: rawStatus,
+		}
+	})
+}
+
+func getProviderStatus(log *zap.SugaredLogger, machine *clusterv1alpha1.Machine) vultrtypes.ProviderStatus {
+	var providerStatus vultrtypes.ProviderStatus
+	status := machine.Status.ProviderStatus
+	if status != nil && status.Raw != nil {
+		if err := json.Unmarshal(status.Raw, &providerStatus); err != nil {
+			log.Error("Failed to parse status from machine object; status was discarded for machine")
+			return vultrtypes.ProviderStatus{}
+		}
+	}
+	return providerStatus
 }

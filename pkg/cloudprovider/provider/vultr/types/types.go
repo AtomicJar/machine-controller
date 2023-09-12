@@ -29,6 +29,10 @@ type RawConfig struct {
 	Tags   []string                            `json:"tags,omitempty"`
 }
 
+type ProviderStatus struct {
+	VultrId string `json:"vultrId"`
+}
+
 func GetConfig(pconfig providerconfigtypes.Config) (*RawConfig, error) {
 	rawConfig := &RawConfig{}
 
