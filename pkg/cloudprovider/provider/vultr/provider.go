@@ -18,13 +18,13 @@ package vultr
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"github.com/vultr/govultr/v2"
-	"strconv"
-
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
+	"strconv"
 
 	"github.com/kubermatic/machine-controller/pkg/apis/cluster/common"
 	clusterv1alpha1 "github.com/kubermatic/machine-controller/pkg/apis/cluster/v1alpha1"
@@ -197,7 +197,7 @@ func (p *provider) Validate(ctx context.Context, _ *zap.SugaredLogger, spec clus
 	return nil
 }
 
-func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (*vultrCloudInstance, error) {
+func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (instance.Instance, error) {
 	c, _, err := p.getConfig(machine.Spec.ProviderSpec)
 	if err != nil {
 		return nil, cloudprovidererrors.TerminalError{
@@ -208,17 +208,34 @@ func (p *provider) get(ctx context.Context, machine *clusterv1alpha1.Machine) (*
 
 	client := getClient(ctx, c.APIKey)
 
-	instances, _, err := client.Instance.List(ctx, &govultr.ListOptions{
-		Tag: string(machine.UID),
-	})
-	if err != nil {
-		return nil, vltErrorToTerminalError(err, "failed to list servers")
-	}
+	if c.MachineType == string(vultrtypes.CloudInstance) || c.MachineType == "" {
+		instances, _, err := client.Instance.List(ctx, &govultr.ListOptions{
+			Tag: string(machine.UID),
+		})
+		if err != nil {
+			return nil, vltErrorToTerminalError(err, "failed to list servers")
+		}
+		for _, inst := range instances {
+			for _, tag := range inst.Tags {
+				if tag == string(machine.UID) {
+					return &vultrCloudInstance{instance: &inst}, nil
+				}
+			}
+		}
+	} else if c.MachineType == string(vultrtypes.BareMetal) {
+		instances, _, err := client.BareMetalServer.List(ctx, &govultr.ListOptions{Tag: fmt.Sprintf("machineUid=%s", machine.UID)})
+		if err != nil {
+			return nil, cloudprovidererrors.TerminalError{
+				Reason:  common.InvalidConfigurationMachineError,
+				Message: err.Error(),
+			}
+		}
 
-	for _, instance := range instances {
-		for _, tag := range instance.Tags {
-			if tag == string(machine.UID) {
-				return &vultrCloudInstance{instance: &instance}, nil
+		for _, inst := range instances {
+			for _, tag := range inst.Tags {
+				if tag == fmt.Sprintf("machineUid=%s", machine.UID) {
+					return &vultrBareMetalInstance{instance: &inst}, nil
+				}
 			}
 		}
 	}
@@ -302,7 +319,7 @@ func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *cl
 }
 
 func (p *provider) Cleanup(ctx context.Context, log *zap.SugaredLogger, machine *clusterv1alpha1.Machine, data *cloudprovidertypes.ProviderData) (bool, error) {
-	instance, err := p.Get(ctx, log, machine, data)
+	inst, err := p.Get(ctx, log, machine, data)
 	if err != nil {
 		if errors.Is(err, cloudprovidererrors.ErrInstanceNotFound) {
 			return true, nil
@@ -319,10 +336,40 @@ func (p *provider) Cleanup(ctx context.Context, log *zap.SugaredLogger, machine 
 	}
 	client := getClient(ctx, c.APIKey)
 
-	if err = client.Instance.Delete(ctx, instance.ID()); err != nil {
-		return false, vltErrorToTerminalError(err, "failed to delete server")
-	}
+	if c.MachineType == string(vultrtypes.CloudInstance) || c.MachineType == "" {
+		if err = client.Instance.Delete(ctx, inst.ID()); err != nil {
+			return false, vltErrorToTerminalError(err, "failed to delete server")
+		}
+	} else if c.MachineType == string(vultrtypes.BareMetal) {
+		// After deleting a Vultr instance, it sometimes comes back online for a moment
+		// and kubelet will try to reconnect, leaving a dangling node on the cluster
+		// We update the machine's cloud-init to make sure `kubelet` will not start on a possible boot after deletion
+		cloudInit := `#cloud-config
+		bootcmd:
+		- [ sh, -xc, "systemctl	disable kubelet" ]
+		- [ sh, -xc, "systemctl	stop kubelet" ]
+		- [ sh, -xc, "systemctl	disable kubelet-healthcheck.service" ]
+		- [ sh, -xc, "systemctl	stop kubelet-healthcheck.service" ]
+		`
+		instanceUpdate := govultr.BareMetalUpdate{
+			UserData: base64.StdEncoding.EncodeToString([]byte(cloudInit)),
+		}
+		_, err = client.BareMetalServer.Update(ctx, inst.ID(), &instanceUpdate)
+		if err != nil {
+			return false, cloudprovidererrors.TerminalError{
+				Reason:  common.InvalidConfigurationMachineError,
+				Message: err.Error(),
+			}
+		}
 
+		err = client.BareMetalServer.Delete(ctx, inst.ID())
+		if err != nil {
+			return false, cloudprovidererrors.TerminalError{
+				Reason:  common.InvalidConfigurationMachineError,
+				Message: err.Error(),
+			}
+		}
+	}
 	return false, nil
 }
 
@@ -344,18 +391,37 @@ func (p *provider) MigrateUID(ctx context.Context, _ *zap.SugaredLogger, machine
 		return fmt.Errorf("failed to decode providerconfig: %w", err)
 	}
 	client := getClient(ctx, c.APIKey)
-	instances, _, err := client.Instance.List(ctx, &govultr.ListOptions{PerPage: 1000})
-	if err != nil {
-		return fmt.Errorf("failed to list instances: %w", err)
-	}
 
-	for _, instance := range instances {
-		if instance.Label == machine.Spec.Name && sets.NewString(instance.Tags...).Has(string(machine.UID)) {
-			_, err = client.Instance.Update(ctx, instance.ID, &govultr.InstanceUpdateReq{
-				Tags: sets.NewString(instance.Tags...).Delete(string(machine.UID)).Insert(string(newUID)).List(),
-			})
-			if err != nil {
-				return fmt.Errorf("failed to tag instance with new UID tag: %w", err)
+	if c.MachineType == string(vultrtypes.CloudInstance) || c.MachineType == "" {
+		instances, _, err := client.Instance.List(ctx, &govultr.ListOptions{PerPage: 1000})
+		if err != nil {
+			return fmt.Errorf("failed to list instances: %w", err)
+		}
+
+		for _, inst := range instances {
+			if inst.Label == machine.Spec.Name && sets.NewString(inst.Tags...).Has(string(machine.UID)) {
+				_, err = client.Instance.Update(ctx, inst.ID, &govultr.InstanceUpdateReq{
+					Tags: sets.NewString(inst.Tags...).Delete(string(machine.UID)).Insert(string(newUID)).List(),
+				})
+				if err != nil {
+					return fmt.Errorf("failed to tag instance with new UID tag: %w", err)
+				}
+			}
+		}
+	} else if c.MachineType == string(vultrtypes.BareMetal) {
+		servers, _, err := client.BareMetalServer.List(ctx, &govultr.ListOptions{PerPage: 1000})
+		if err != nil {
+			return fmt.Errorf("failed to list instances: %w", err)
+		}
+
+		for _, server := range servers {
+			if server.Label == machine.Spec.Name && sets.NewString(server.Tags...).Has(string(machine.UID)) {
+				_, err = client.BareMetalServer.Update(ctx, server.ID, &govultr.BareMetalUpdate{
+					Tags: sets.NewString(server.Tags...).Delete(string(machine.UID)).Insert(string(newUID)).List(),
+				})
+				if err != nil {
+					return fmt.Errorf("failed to tag bare metal server with new UID tag: %w", err)
+				}
 			}
 		}
 	}
