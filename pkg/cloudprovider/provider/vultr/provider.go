@@ -362,7 +362,7 @@ func (p *provider) waitForInstanceCreation(ctx context.Context, c *Config, insta
 
 		if err != nil {
 			if cloudprovidererrors.IsNotFound(err) {
-				// Continue the loop as the instances was succesfully fetched
+				// Continue the loop as the instances was successfully fetched
 				// just that our instance was not found
 				return false, nil
 			}
@@ -427,7 +427,7 @@ func (p *provider) createPhysicalMachine(ctx context.Context, client *govultr.Cl
 	return &vultrPhysicalMachine{instance: instance}, nil
 }
 
-func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *clusterv1alpha1.Machine, _ *cloudprovidertypes.ProviderData, userdata string) (instance.Instance, error) {
+func (p *provider) Create(ctx context.Context, log *zap.SugaredLogger, machine *clusterv1alpha1.Machine, _ *cloudprovidertypes.ProviderData, userdata string) (instance.Instance, error) {
 	c, pc, err := p.getConfig(machine.Spec.ProviderSpec)
 	if err != nil {
 		return nil, cloudprovidererrors.TerminalError{
@@ -468,7 +468,17 @@ func (p *provider) Create(ctx context.Context, _ *zap.SugaredLogger, machine *cl
 		}
 	}
 
-	if err := p.waitForInstanceCreation(ctx, c, instance, machine); err != nil {
+	err = p.waitForInstanceCreation(ctx, c, instance, machine)
+	if err != nil {
+		if !c.PhysicalMachine {
+			if err := client.Instance.Delete(ctx, instance.ID()); err != nil {
+				log.Error("Failed to cleanup instance after failed creation: %v", err)
+			}
+		} else {
+			if err := client.BareMetalServer.Delete(ctx, instance.ID()); err != nil {
+				log.Error("Failed to cleanup bare metal instance after failed creation: %v", err)
+			}
+		}
 		return nil, err
 	}
 	return instance, nil
