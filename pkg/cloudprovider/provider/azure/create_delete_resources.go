@@ -319,7 +319,7 @@ func getVirtualNetwork(ctx context.Context, c *config) (network.VirtualNetwork, 
 	return virtualNetworksClient.Get(ctx, c.VNetResourceGroup, c.VNetName, "")
 }
 
-func createOrUpdateNetworkInterface(ctx context.Context, log *zap.SugaredLogger, ifName string, machineUID types.UID, config *config, publicIP, publicIPv6 *network.PublicIPAddress, ipFamily util.IPFamily, enableAcceleratedNetworking *bool) (*network.Interface, error) {
+func createOrUpdateNetworkInterface(ctx context.Context, log *zap.SugaredLogger, ifName string, machineUID types.UID, config *config, publicIP, publicIPv6 *network.PublicIPAddress, ipFamily util.IPFamily, enableAcceleratedNetworking *bool, enableIPForwarding *bool) (*network.Interface, error) {
 	ifClient, err := getInterfacesClient(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create interfaces client: %w", err)
@@ -363,6 +363,7 @@ func createOrUpdateNetworkInterface(ctx context.Context, log *zap.SugaredLogger,
 	}
 
 	ifSpec.InterfacePropertiesFormat.EnableAcceleratedNetworking = enableAcceleratedNetworking
+	ifSpec.InterfacePropertiesFormat.EnableIPForwarding = enableIPForwarding
 
 	if config.SecurityGroupName != "" {
 		authorizer, err := auth.NewClientCredentialsConfig(config.ClientID, config.ClientSecret, config.TenantID).Authorizer()

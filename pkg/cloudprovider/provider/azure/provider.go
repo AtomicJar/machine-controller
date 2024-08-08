@@ -106,6 +106,7 @@ type config struct {
 	AssignPublicIP              bool
 	PublicIPSKU                 *network.PublicIPAddressSkuName
 	EnableAcceleratedNetworking *bool
+	EnableIPForwarding          *bool
 	EnableBootDiagnostics       bool
 	Tags                        map[string]string
 }
@@ -335,6 +336,7 @@ func (p *provider) getConfig(provSpec clusterv1alpha1.ProviderSpec) (*config, *p
 
 	c.AssignAvailabilitySet = rawCfg.AssignAvailabilitySet
 	c.EnableAcceleratedNetworking = rawCfg.EnableAcceleratedNetworking
+	c.EnableIPForwarding = rawCfg.EnableIPForwarding
 
 	c.AvailabilitySet, err = p.configVarResolver.GetConfigVarStringValue(rawCfg.AvailabilitySet)
 	if err != nil {
@@ -639,7 +641,7 @@ func (p *provider) Create(ctx context.Context, log *zap.SugaredLogger, machine *
 		return nil, err
 	}
 
-	iface, err := createOrUpdateNetworkInterface(ctx, log, ifaceName(machine), machine.UID, config, publicIP, publicIPv6, ipFamily, config.EnableAcceleratedNetworking)
+	iface, err := createOrUpdateNetworkInterface(ctx, log, ifaceName(machine), machine.UID, config, publicIP, publicIPv6, ipFamily, config.EnableAcceleratedNetworking, config.EnableIPForwarding)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate main network interface: %w", err)
 	}
@@ -1157,7 +1159,7 @@ func (p *provider) MigrateUID(ctx context.Context, log *zap.SugaredLogger, machi
 	}
 
 	if kuberneteshelper.HasFinalizer(machine, finalizerNIC) {
-		_, err = createOrUpdateNetworkInterface(ctx, log, ifaceName(machine), newUID, config, publicIP, publicIPv6, util.IPFamilyUnspecified, config.EnableAcceleratedNetworking)
+		_, err = createOrUpdateNetworkInterface(ctx, log, ifaceName(machine), newUID, config, publicIP, publicIPv6, util.IPFamilyUnspecified, config.EnableAcceleratedNetworking, config.EnableIPForwarding)
 		if err != nil {
 			return fmt.Errorf("failed to update UID on main network interface: %w", err)
 		}
